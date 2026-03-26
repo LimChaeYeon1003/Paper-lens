@@ -49,7 +49,7 @@ async function callGemini(system, userParts, onChunk, apiKey) {
       if (!apiKey) {
         return "⚠️ API Key가 설정되지 않았습니다.\n\n**무료 키 발급 방법:**\n1. https://aistudio.google.com/apikey 접속\n2. Google 로그인 → Create API Key\n3. 🔒 버튼 클릭 → 키 입력";
       }
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
       res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
