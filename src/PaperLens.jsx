@@ -20,22 +20,36 @@ function usePdfJs() {
 /* ════════════ Claude streaming call ════════════ */
 async function callClaude(system, userContent, onChunk, apiKey) {
   try {
-    const headers = { "Content-Type": "application/json" };
-    if (apiKey) headers["x-api-key"] = apiKey;
-    if (apiKey) headers["anthropic-version"] = "2023-06-01";
-    if (apiKey) headers["anthropic-dangerous-direct-browser-access"] = "true";
+    const payload = {
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4000,
+      system,
+      messages: [{ role: "user", content: userContent }],
+      stream: true,
+    };
 
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 4000,
-        system,
-        messages: [{ role: "user", content: userContent }],
-        stream: true,
-      }),
-    });
+    // Try server-side proxy first (/api/chat), then fall back to direct API
+    let url = "/api/chat";
+    let headers = { "Content-Type": "application/json" };
+    if (apiKey) headers["x-api-key"] = apiKey;
+
+    let res;
+    try {
+      res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+      // If proxy returns 404 (not deployed as Vercel), fall back to direct API
+      if (res.status === 404) throw new Error("proxy not found");
+    } catch {
+      // Fallback: direct Anthropic API (works inside claude.ai artifacts)
+      url = "https://api.anthropic.com/v1/messages";
+      headers = { "Content-Type": "application/json" };
+      if (apiKey) {
+        headers["x-api-key"] = apiKey;
+        headers["anthropic-version"] = "2023-06-01";
+        headers["anthropic-dangerous-direct-browser-access"] = "true";
+      }
+      res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    }
+
     if (!res.ok) {
       const err = await res.text();
       return `⚠️ API 오류 (${res.status}): ${err.slice(0, 200)}`;

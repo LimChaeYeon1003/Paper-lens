@@ -13,30 +13,41 @@ AI 기반 학술 논문 PDF 뷰어입니다. 논문을 업로드하면 AI가 요
 - 📖 쉬운 설명 — 비전공자 눈높이 설명
 - 📝 노트 — 메모 기능
 
-## 배포 방법
+## 배포 방법 (Vercel 추천)
 
-### 방법 1: Vercel (추천 — 가장 쉬움)
+### 1. GitHub에 업로드
 
-1. 이 폴더를 GitHub에 업로드
-2. [vercel.com](https://vercel.com) 에서 GitHub 로그인
-3. "Import Project" → 이 레포 선택
-4. "Deploy" 클릭 — 끝!
+```bash
+cd paper-lens
+git init && git add . && git commit -m "init"
+git remote add origin https://github.com/YOUR_ID/paper-lens.git
+git push -u origin main
+```
 
-### 방법 2: 로컬 실행
+### 2. Vercel에 배포
+
+1. [vercel.com](https://vercel.com) → GitHub 로그인
+2. "Import Project" → 레포 선택 → Deploy
+
+### 3. ⚠️ API Key 설정 (필수!)
+
+Vercel 대시보드에서:
+1. 프로젝트 → **Settings** → **Environment Variables**
+2. `ANTHROPIC_API_KEY` = `sk-ant-api03-...` 입력
+3. **Redeploy** 클릭
+
+또는 사용자가 앱 내 🔒 버튼으로 개인 API Key를 입력할 수도 있습니다.
+
+### 로컬 실행
 
 ```bash
 npm install
-npm run dev
+ANTHROPIC_API_KEY=sk-ant-... npm run dev
 ```
-
-브라우저에서 `http://localhost:5173` 접속
-
-### 방법 3: Netlify
-
-1. `npm run build` 실행
-2. [netlify.com](https://netlify.com) 에서 `dist` 폴더 드래그 앤 드롭
 
 ## 기술 스택
 
 - React 18 + Vite
 - Anthropic Claude API (스트리밍)
+- Vercel Serverless Functions (API 프록시)
+- PDF.js (PDF 렌더링)
