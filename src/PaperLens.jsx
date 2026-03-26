@@ -17,68 +17,85 @@ function usePdfJs() {
   return ready;
 }
 
-/* ════════════ Claude streaming call ════════════ */
-async function callClaude(system, userContent, onChunk, apiKey) {
+/* ════════════ Gemini streaming call ════════════ */
+async function callGemini(system, userParts, onChunk, apiKey) {
   try {
-    const payload = {
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4000,
-      system,
-      messages: [{ role: "user", content: userContent }],
-      stream: true,
+    // Build Gemini request
+    const geminiBody = {
+      system_instruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: userParts }],
+      generationConfig: { maxOutputTokens: 4096, temperature: 0.7 },
     };
 
-    // Try server-side proxy first (/api/chat), then fall back to direct API
-    let url = "/api/chat";
-    let headers = { "Content-Type": "application/json" };
-    if (apiKey) headers["x-api-key"] = apiKey;
-
     let res;
+    const proxyHeaders = { "Content-Type": "application/json" };
+
+    // Try server proxy first (Vercel deployment)
     try {
-      res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
-      // If proxy returns 404 (not deployed as Vercel), fall back to direct API
-      if (res.status === 404) throw new Error("proxy not found");
-    } catch {
-      // Fallback: direct Anthropic API (works inside claude.ai artifacts)
-      url = "https://api.anthropic.com/v1/messages";
-      headers = { "Content-Type": "application/json" };
-      if (apiKey) {
-        headers["x-api-key"] = apiKey;
-        headers["anthropic-version"] = "2023-06-01";
-        headers["anthropic-dangerous-direct-browser-access"] = "true";
+      if (apiKey) proxyHeaders["x-api-key"] = apiKey;
+      res = await fetch("/api/chat", {
+        method: "POST",
+        headers: proxyHeaders,
+        body: JSON.stringify({ system, contents: geminiBody.contents }),
+      });
+      if (res.status === 404 || res.status === 405) throw new Error("proxy not available");
+      if (res.status === 401) {
+        // No API key on server, try direct if user provided one
+        if (apiKey) throw new Error("try direct");
+        return "⚠️ Gemini API Key가 필요합니다. 🔒 버튼을 눌러 키를 입력하거나, Vercel에 GEMINI_API_KEY 환경변수를 설정해주세요.\n\n무료 키 발급: https://aistudio.google.com/apikey";
       }
-      res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    } catch {
+      // Fallback: direct Gemini API (works if user entered key)
+      if (!apiKey) {
+        return "⚠️ API Key가 설정되지 않았습니다.\n\n**무료 키 발급 방법:**\n1. https://aistudio.google.com/apikey 접속\n2. Google 로그인 → Create API Key\n3. 🔒 버튼 클릭 → 키 입력";
+      }
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${apiKey}`;
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(geminiBody),
+      });
     }
 
     if (!res.ok) {
       const err = await res.text();
-      return `⚠️ API 오류 (${res.status}): ${err.slice(0, 200)}`;
+      return `⚠️ API 오류 (${res.status}): ${err.slice(0, 300)}`;
     }
+
+    // Parse Gemini SSE stream
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let full = "";
+    let buffer = "";
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      for (const line of dec.decode(value).split("\n")) {
+      buffer += dec.decode(value, { stream: true });
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
         if (line.startsWith("data: ")) {
           try {
             const j = JSON.parse(line.slice(6));
-            if (j.type === "content_block_delta" && j.delta?.text) {
-              full += j.delta.text;
+            const text = j?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) {
+              full += text;
               onChunk?.(full);
             }
           } catch {}
         }
       }
     }
-    return full;
+    return full || "응답이 비어있습니다.";
   } catch (e) {
     return "⚠️ 연결 오류: " + e.message;
   }
 }
 
-/* ════════════ markdown renderer ════════════ */
+/* ════════════ markdown → html ════════════ */
 function md(t) {
   if (!t) return "";
   return t
@@ -137,7 +154,6 @@ export default function PaperLens() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const endRef = useRef(null);
-  const pdfScrollRef = useRef(null);
 
   const [results, setResults] = useState({});
   const [activeA, setActiveA] = useState(null);
@@ -148,7 +164,7 @@ export default function PaperLens() {
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
-  /* ── render PDF pages ── */
+  /* ── render PDF ── */
   const renderPdf = useCallback(async (arrayBuf) => {
     if (!window.pdfjsLib) return;
     setPdfLoading(true);
@@ -156,23 +172,17 @@ export default function PaperLens() {
       const pdf = await window.pdfjsLib.getDocument({ data: arrayBuf }).promise;
       setTotalPages(pdf.numPages);
       const rendered = [];
-      const pagesToRender = Math.min(pdf.numPages, 50);
-      for (let i = 1; i <= pagesToRender; i++) {
+      for (let i = 1; i <= Math.min(pdf.numPages, 50); i++) {
         const page = await pdf.getPage(i);
-        const scale = 1.5;
-        const vp = page.getViewport({ scale });
+        const vp = page.getViewport({ scale: 1.5 });
         const canvas = document.createElement("canvas");
-        canvas.width = vp.width;
-        canvas.height = vp.height;
-        const ctx = canvas.getContext("2d");
-        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        canvas.width = vp.width; canvas.height = vp.height;
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
         rendered.push(canvas.toDataURL("image/jpeg", 0.85));
       }
       setPages(rendered);
       setCurrentPage(1);
-    } catch (e) {
-      console.error("PDF render error:", e);
-    }
+    } catch (e) { console.error("PDF render:", e); }
     setPdfLoading(false);
   }, []);
 
@@ -191,10 +201,20 @@ export default function PaperLens() {
 
     setMsgs([{
       role: "assistant",
-      content: `📄 **${f.name}** 을(를) 로드했습니다!\n\n💬 **채팅** — 논문에 대해 자유롭게 질문\n📊 **분석** — 요약, 평가, 번역 등 원클릭 분석\n📝 **노트** — 읽으며 메모 남기기\n\n아래 빠른 질문을 클릭하거나 직접 입력해보세요.`
+      content: `📄 **${f.name}** 로드 완료!\n\n💬 **채팅** — 논문에 대해 자유롭게 질문\n📊 **분석** — 요약, 평가, 번역 등 원클릭 분석\n📝 **노트** — 읽으며 메모 남기기\n\n아래 빠른 질문을 클릭하거나 직접 입력해보세요.`
     }]);
     setSide(true); setTab("chat");
   }, [pdfReady, renderPdf]);
+
+  /* ── build Gemini parts ── */
+  const buildParts = (text) => {
+    const parts = [];
+    if (pdfB64) {
+      parts.push({ inline_data: { mime_type: "application/pdf", data: pdfB64 } });
+    }
+    parts.push({ text });
+    return parts;
+  };
 
   /* ── chat ── */
   const send = async (custom) => {
@@ -205,11 +225,13 @@ export default function PaperLens() {
     setMsgs(next); setStreaming(true);
     const idx = next.length;
     setMsgs([...next, { role: "assistant", content: "⏳ 분석 중..." }]);
-    const sys = `You are PaperLens AI, an expert academic paper analysis assistant. Always respond in Korean unless asked otherwise. Use markdown formatting. Be precise and cite specific parts of the paper.`;
-    const uc = pdfB64
-      ? [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfB64 } }, { type: "text", text: m }]
-      : m;
-    await callClaude(sys, uc, (p) => setMsgs(prev => { const c = [...prev]; c[idx] = { role: "assistant", content: p }; return c; }), apiKey);
+
+    const sys = `You are PaperLens AI, an expert academic paper analysis assistant. Always respond in Korean unless asked otherwise. Use markdown formatting. Be precise and cite specific parts of the paper when relevant.`;
+    const parts = buildParts(m);
+
+    await callGemini(sys, parts, (p) => {
+      setMsgs(prev => { const c = [...prev]; c[idx] = { role: "assistant", content: p }; return c; });
+    }, apiKey);
     setStreaming(false);
   };
 
@@ -217,21 +239,21 @@ export default function PaperLens() {
   const runA = async (k) => {
     if (results[k]) { setActiveA(k); setTab("analysis"); return; }
     setTab("analysis"); setActiveA(k); setALoading(true);
-    const uc = pdfB64
-      ? [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfB64 } }, { type: "text", text: "이 논문을 분석해주세요." }]
-      : "논문을 분석해주세요.";
-    await callClaude(PRESETS[k].sys, uc, (p) => setResults(prev => ({ ...prev, [k]: p })), apiKey);
+    const parts = buildParts("이 논문을 분석해주세요.");
+    await callGemini(PRESETS[k].sys, parts, (p) => setResults(prev => ({ ...prev, [k]: p })), apiKey);
     setALoading(false);
   };
 
   /* ── notes ── */
-  const addNote = () => { if (!noteIn.trim()) return; setNotes(p => [...p, { id: Date.now(), t: noteIn, time: new Date().toLocaleTimeString("ko-KR"), c: ["#D4A028","#4ECDC4","#FF6B6B","#A78BFA","#34D399"][Math.floor(Math.random() * 5)] }]); setNoteIn(""); };
+  const addNote = () => {
+    if (!noteIn.trim()) return;
+    setNotes(p => [...p, { id: Date.now(), t: noteIn, time: new Date().toLocaleTimeString("ko-KR"), c: ["#D4A028","#4ECDC4","#FF6B6B","#A78BFA","#34D399"][Math.floor(Math.random()*5)] }]);
+    setNoteIn("");
+  };
 
-  /* ── scroll to page ── */
   const scrollToPage = (n) => {
     setCurrentPage(n);
-    const el = document.getElementById(`pdf-page-${n}`);
-    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    document.getElementById(`pdf-page-${n}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
   /* ═══════════════════ RENDER ═══════════════════ */
@@ -239,7 +261,6 @@ export default function PaperLens() {
     <div style={S.root}>
       <style>{CSS}</style>
 
-      {/* HEADER */}
       <header style={S.hdr}>
         <div style={S.hdrL}>
           <span style={S.logoI}>◈</span>
@@ -258,46 +279,33 @@ export default function PaperLens() {
         </div>
       </header>
 
-      {/* API KEY BAR */}
       {showKeyInput && (
         <div style={S.keyBar}>
-          <span style={{ fontSize: 12, color: "#9CA3AF" }}>🔑 Anthropic API Key (배포 환경용, claude.ai에서는 불필요):</span>
-          <input
-            style={S.keyInput}
-            type="password"
-            value={apiKey}
-            onChange={e => setApiKey(e.target.value)}
-            placeholder="sk-ant-..."
-          />
+          <span style={{ fontSize: 12, color: "#9CA3AF" }}>🔑 Gemini API Key (무료):</span>
+          <input style={S.keyInput} type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="AIzaSy..." />
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" style={S.keyLink}>무료 발급</a>
           <button style={S.keyOk} onClick={() => setShowKeyInput(false)}>확인</button>
         </div>
       )}
 
       <div style={S.body}>
-        {/* ── PDF VIEWER ── */}
+        {/* PDF */}
         <div style={{ ...S.pdfPanel, flex: side && file ? "1 1 58%" : "1 1 100%" }}>
           {file ? (
             <div style={S.pdfContainer}>
-              {/* Page nav */}
               {totalPages > 0 && (
                 <div style={S.pageNav}>
-                  <button style={S.pgBtn} onClick={() => scrollToPage(Math.max(1, currentPage - 1))} disabled={currentPage <= 1}>◀</button>
+                  <button style={S.pgBtn} onClick={() => scrollToPage(Math.max(1, currentPage - 1))}>◀</button>
                   <span style={S.pgInfo}>{currentPage} / {totalPages}</span>
-                  <button style={S.pgBtn} onClick={() => scrollToPage(Math.min(totalPages, currentPage + 1))} disabled={currentPage >= totalPages}>▶</button>
+                  <button style={S.pgBtn} onClick={() => scrollToPage(Math.min(totalPages, currentPage + 1))}>▶</button>
                 </div>
               )}
-              {/* Pages */}
-              <div style={S.pdfScroll} ref={pdfScrollRef}>
-                {pdfLoading && (
-                  <div style={S.pdfLoading}>
-                    <div style={S.spinner}>◈</div>
-                    <p>PDF 렌더링 중...</p>
-                  </div>
-                )}
+              <div style={S.pdfScroll}>
+                {pdfLoading && <div style={S.pdfLoading}><div style={S.spinner}>◈</div><p>PDF 렌더링 중...</p></div>}
                 {pages.map((src, i) => (
-                  <div key={i} id={`pdf-page-${i + 1}`} style={S.pageWrap}>
-                    <img src={src} style={S.pageImg} alt={`Page ${i + 1}`} />
-                    <div style={S.pageLabel}>Page {i + 1}</div>
+                  <div key={i} id={`pdf-page-${i+1}`} style={S.pageWrap}>
+                    <img src={src} style={S.pageImg} alt={`Page ${i+1}`} />
+                    <div style={S.pageLabel}>Page {i+1}</div>
                   </div>
                 ))}
               </div>
@@ -308,90 +316,77 @@ export default function PaperLens() {
                 <div style={S.dropIco}>◈</div>
                 <h2 style={S.dropH}>논문을 업로드하세요</h2>
                 <p style={S.dropP}>PDF 파일을 드래그하거나 클릭하여 업로드</p>
-                <label style={S.dropBtn}>
-                  <input type="file" accept=".pdf" hidden onChange={e => loadFile(e.target.files[0])} />
-                  PDF 파일 선택
-                </label>
-                <div style={S.tags}>
-                  {["💬 AI 채팅", "⭐ 논문 평가", "📋 요약", "🌏 번역", "🔬 방법론", "📝 노트"].map(x => <span key={x} style={S.tag}>{x}</span>)}
-                </div>
+                <label style={S.dropBtn}><input type="file" accept=".pdf" hidden onChange={e => loadFile(e.target.files[0])} />PDF 파일 선택</label>
+                <div style={S.tags}>{["💬 AI 채팅","⭐ 논문 평가","📋 요약","🌏 번역","🔬 방법론","📝 노트"].map(x => <span key={x} style={S.tag}>{x}</span>)}</div>
+                <p style={{ fontSize: 11, color: "#6B7280", marginTop: 16 }}>Powered by Google Gemini (무료)</p>
               </div>
             </div>
           )}
         </div>
 
-        {/* ── SIDE PANEL ── */}
+        {/* SIDE */}
         {side && file && (
           <div style={S.side}>
             <div style={S.tabBar}>
-              {[{ k: "chat", l: "💬 채팅" }, { k: "analysis", l: "📊 분석" }, { k: "notes", l: "📝 노트" }].map(x => (
-                <button key={x.k} style={{ ...S.tabBtn, ...(tab === x.k ? S.tabAct : {}) }} onClick={() => setTab(x.k)}>{x.l}</button>
+              {[{k:"chat",l:"💬 채팅"},{k:"analysis",l:"📊 분석"},{k:"notes",l:"📝 노트"}].map(x => (
+                <button key={x.k} style={{...S.tabBtn,...(tab===x.k?S.tabAct:{})}} onClick={()=>setTab(x.k)}>{x.l}</button>
               ))}
             </div>
 
-            {/* CHAT */}
             {tab === "chat" && (
               <div style={S.tabC}>
                 <div style={S.chatScroll}>
-                  {msgs.map((m, i) => (
-                    <div key={i} style={m.role === "user" ? S.uRow : S.aRow}>
-                      {m.role === "assistant" && <div style={S.avatar}>◈</div>}
-                      <div style={m.role === "user" ? S.uBub : S.aBub} dangerouslySetInnerHTML={{ __html: md(m.content) }} />
+                  {msgs.map((m,i) => (
+                    <div key={i} style={m.role==="user"?S.uRow:S.aRow}>
+                      {m.role==="assistant" && <div style={S.avatar}>◈</div>}
+                      <div style={m.role==="user"?S.uBub:S.aBub} dangerouslySetInnerHTML={{__html:md(m.content)}} />
                     </div>
                   ))}
                   <div ref={endRef} />
                 </div>
                 <div style={S.qWrap}>
-                  {QUICK.map((q, i) => <button key={i} className="qb" style={S.qBtn} onClick={() => send(q)}>{q}</button>)}
+                  {QUICK.map((q,i) => <button key={i} className="qb" style={S.qBtn} onClick={() => send(q)}>{q}</button>)}
                 </div>
                 <div style={S.inpWrap}>
-                  <input style={S.inp} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()} placeholder="논문에 대해 질문하세요..." disabled={streaming} />
-                  <button style={{ ...S.sendBtn, opacity: streaming || !input.trim() ? 0.4 : 1 }} onClick={() => send()} disabled={streaming || !input.trim()}>{streaming ? "⏳" : "↑"}</button>
+                  <input style={S.inp} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()} placeholder="논문에 대해 질문하세요..." disabled={streaming} />
+                  <button style={{...S.sendBtn,opacity:streaming||!input.trim()?0.4:1}} onClick={()=>send()} disabled={streaming||!input.trim()}>{streaming?"⏳":"↑"}</button>
                 </div>
               </div>
             )}
 
-            {/* ANALYSIS */}
             {tab === "analysis" && (
               <div style={S.tabC}>
                 <div style={S.aGrid}>
-                  {Object.entries(PRESETS).map(([k, v]) => (
-                    <button key={k} className="ac" style={{ ...S.aCard, ...(activeA === k ? S.aCardAct : {}), ...(results[k] ? { borderColor: "#34D39944" } : {}) }} onClick={() => runA(k)}>
-                      <span style={{ fontSize: 20 }}>{v.icon}</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={S.aLabel}>{v.label}</div>
-                        <div style={S.aDesc}>{v.desc}</div>
-                      </div>
-                      {results[k] && <span style={{ color: "#34D399", fontWeight: 700 }}>✓</span>}
+                  {Object.entries(PRESETS).map(([k,v]) => (
+                    <button key={k} className="ac" style={{...S.aCard,...(activeA===k?S.aCardAct:{}),...(results[k]?{borderColor:"#34D39944"}:{})}} onClick={() => runA(k)}>
+                      <span style={{fontSize:20}}>{v.icon}</span>
+                      <div style={{flex:1,minWidth:0}}><div style={S.aLabel}>{v.label}</div><div style={S.aDesc}>{v.desc}</div></div>
+                      {results[k] && <span style={{color:"#34D399",fontWeight:700}}>✓</span>}
                     </button>
                   ))}
                 </div>
                 {activeA && (
                   <div style={S.aRes}>
-                    <div style={S.aResH}>
-                      <span>{PRESETS[activeA]?.icon} {PRESETS[activeA]?.label}</span>
-                      {aLoading && <span className="spin">⟳</span>}
-                    </div>
-                    <div style={S.aResB} dangerouslySetInnerHTML={{ __html: md(results[activeA] || "분석을 시작합니다...") }} />
+                    <div style={S.aResH}><span>{PRESETS[activeA]?.icon} {PRESETS[activeA]?.label}</span>{aLoading && <span className="spin">⟳</span>}</div>
+                    <div style={S.aResB} dangerouslySetInnerHTML={{__html:md(results[activeA]||"분석을 시작합니다...")}} />
                   </div>
                 )}
-                {!activeA && <div style={{ padding: 40, textAlign: "center", color: "#6B7280", fontSize: 14 }}>위 카드를 클릭하여 분석을 시작하세요</div>}
+                {!activeA && <div style={{padding:40,textAlign:"center",color:"#6B7280",fontSize:14}}>위 카드를 클릭하여 분석을 시작하세요</div>}
               </div>
             )}
 
-            {/* NOTES */}
             {tab === "notes" && (
               <div style={S.tabC}>
                 <div style={S.nInpW}>
-                  <input style={S.nInp} value={noteIn} onChange={e => setNoteIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addNote()} placeholder="메모를 입력하세요..." />
+                  <input style={S.nInp} value={noteIn} onChange={e=>setNoteIn(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addNote()} placeholder="메모를 입력하세요..." />
                   <button style={S.nAdd} onClick={addNote}>+</button>
                 </div>
                 <div style={S.nList}>
-                  {notes.length === 0 && <div style={{ textAlign: "center", padding: 40, color: "#6B7280" }}>📝 메모를 남겨보세요</div>}
+                  {notes.length===0 && <div style={{textAlign:"center",padding:40,color:"#6B7280"}}>📝 메모를 남겨보세요</div>}
                   {notes.map(n => (
-                    <div key={n.id} style={{ ...S.nCard, borderLeft: `3px solid ${n.c}` }}>
-                      <div style={{ fontSize: 13, lineHeight: 1.6 }}>{n.t}</div>
-                      <div style={S.nMeta}><span>{n.time}</span><button style={S.nDel} onClick={() => setNotes(p => p.filter(x => x.id !== n.id))}>×</button></div>
+                    <div key={n.id} style={{...S.nCard,borderLeft:`3px solid ${n.c}`}}>
+                      <div style={{fontSize:13,lineHeight:1.6}}>{n.t}</div>
+                      <div style={S.nMeta}><span>{n.time}</span><button style={S.nDel} onClick={()=>setNotes(p=>p.filter(x=>x.id!==n.id))}>×</button></div>
                     </div>
                   ))}
                 </div>
@@ -406,10 +401,10 @@ export default function PaperLens() {
 
 /* ═══════════════════ STYLES ═══════════════════ */
 const P = {
-  bg: "#111318", s1: "#181B24", s2: "#1F2333", s3: "#272C3F",
-  brd: "#2D3348", tx: "#EAEAEA", dim: "#8891A5",
-  acc: "#D4A028", accG: "rgba(212,160,40,0.1)",
-  grn: "#34D399", red: "#FF6B6B",
+  bg:"#111318", s1:"#181B24", s2:"#1F2333", s3:"#272C3F",
+  brd:"#2D3348", tx:"#EAEAEA", dim:"#8891A5",
+  acc:"#D4A028", accG:"rgba(212,160,40,0.1)",
+  grn:"#34D399", red:"#FF6B6B",
 };
 
 const CSS = `
@@ -426,81 +421,69 @@ const CSS = `
 `;
 
 const S = {
-  root: { fontFamily: "'Noto Sans KR',sans-serif", background: P.bg, color: P.tx, height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" },
-  hdr: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 16px", height: 48, background: P.s1, borderBottom: `1px solid ${P.brd}`, flexShrink: 0 },
-  hdrL: { display: "flex", alignItems: "center", gap: 12 },
-  hdrR: { display: "flex", alignItems: "center", gap: 8 },
-  logoI: { fontSize: 20, color: P.acc, fontWeight: 700 },
-  logoT: { fontSize: 15, fontWeight: 700, fontFamily: "'IBM Plex Mono',monospace", background: `linear-gradient(135deg,${P.acc},#F0D060)`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" },
-  fname: { fontSize: 11, color: P.dim, background: P.s2, padding: "3px 10px", borderRadius: 6, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  upBtn: { padding: "5px 12px", background: P.acc, color: P.bg, border: "none", borderRadius: 7, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "'Noto Sans KR'" },
-  togBtn: { padding: "5px 10px", background: P.s2, color: P.tx, border: `1px solid ${P.brd}`, borderRadius: 7, fontSize: 14, cursor: "pointer" },
-  keyBtn: { padding: "5px 8px", background: "transparent", border: `1px solid ${P.brd}`, borderRadius: 6, fontSize: 14, cursor: "pointer" },
-  keyBar: { display: "flex", alignItems: "center", gap: 8, padding: "6px 16px", background: P.s2, borderBottom: `1px solid ${P.brd}`, flexShrink: 0 },
-  keyInput: { flex: 1, padding: "5px 10px", background: P.s3, color: P.tx, border: `1px solid ${P.brd}`, borderRadius: 6, fontSize: 12, outline: "none", fontFamily: "monospace" },
-  keyOk: { padding: "5px 12px", background: P.acc, color: P.bg, border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer" },
-
-  body: { flex: 1, display: "flex", overflow: "hidden" },
-
-  /* PDF panel */
-  pdfPanel: { display: "flex", flexDirection: "column", transition: "flex 0.3s", borderRight: `1px solid ${P.brd}`, overflow: "hidden" },
-  pdfContainer: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" },
-  pageNav: { display: "flex", alignItems: "center", justifyContent: "center", gap: 12, padding: "6px 0", background: P.s1, borderBottom: `1px solid ${P.brd}`, flexShrink: 0 },
-  pgBtn: { padding: "3px 10px", background: P.s2, color: P.tx, border: `1px solid ${P.brd}`, borderRadius: 5, cursor: "pointer", fontSize: 12 },
-  pgInfo: { fontSize: 12, color: P.dim, fontFamily: "'IBM Plex Mono'" },
-  pdfScroll: { flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", alignItems: "center", gap: 8, background: "#2A2D35" },
-  pdfLoading: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 60, color: P.dim },
-  spinner: { fontSize: 32, color: P.acc, animation: "spin 2s linear infinite", marginBottom: 12 },
-  pageWrap: { position: "relative", width: "100%", maxWidth: 800 },
-  pageImg: { width: "100%", borderRadius: 4, boxShadow: "0 2px 12px rgba(0,0,0,0.4)" },
-  pageLabel: { position: "absolute", bottom: 6, right: 10, fontSize: 10, color: P.dim, background: "rgba(0,0,0,0.5)", padding: "2px 8px", borderRadius: 4 },
-
-  /* drop zone */
-  drop: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: `radial-gradient(ellipse at center,${P.s2} 0%,${P.bg} 70%)` },
-  dropIn: { textAlign: "center", padding: 40, maxWidth: 440 },
-  dropIco: { fontSize: 56, color: P.acc, marginBottom: 16, animation: "float 3s ease-in-out infinite", display: "block" },
-  dropH: { fontSize: 20, fontWeight: 700, marginBottom: 6 },
-  dropP: { fontSize: 13, color: P.dim, marginBottom: 22 },
-  dropBtn: { display: "inline-block", padding: "11px 28px", background: P.acc, color: P.bg, border: "none", borderRadius: 10, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "'Noto Sans KR'", marginBottom: 18 },
-  tags: { display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center" },
-  tag: { padding: "3px 10px", background: P.accG, color: P.acc, borderRadius: 20, fontSize: 11 },
-
-  /* side panel */
-  side: { flex: "0 0 380px", maxWidth: 380, display: "flex", flexDirection: "column", background: P.s1, animation: "fadeUp 0.25s ease" },
-  tabBar: { display: "flex", borderBottom: `1px solid ${P.brd}`, flexShrink: 0 },
-  tabBtn: { flex: 1, padding: "9px 0", background: "transparent", color: P.dim, border: "none", borderBottom: "2px solid transparent", fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "'Noto Sans KR'", transition: "all 0.15s" },
-  tabAct: { color: P.acc, borderBottomColor: P.acc },
-  tabC: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" },
-
-  /* chat */
-  chatScroll: { flex: 1, overflow: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 },
-  uRow: { display: "flex", justifyContent: "flex-end", animation: "fadeUp 0.2s" },
-  aRow: { display: "flex", gap: 7, alignItems: "flex-start", animation: "fadeUp 0.25s" },
-  avatar: { width: 24, height: 24, borderRadius: 6, background: P.accG, color: P.acc, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, flexShrink: 0, marginTop: 2 },
-  uBub: { background: P.acc, color: P.bg, padding: "7px 12px", borderRadius: "12px 12px 3px 12px", maxWidth: "82%", fontSize: 13, lineHeight: 1.6, fontWeight: 500 },
-  aBub: { background: P.s2, color: P.tx, padding: "9px 12px", borderRadius: "3px 12px 12px 12px", maxWidth: "calc(100% - 32px)", fontSize: 13, lineHeight: 1.7, border: `1px solid ${P.brd}` },
-  qWrap: { padding: "5px 10px", display: "flex", flexWrap: "wrap", gap: 4, borderTop: `1px solid ${P.brd}`, maxHeight: 68, overflowY: "auto", flexShrink: 0 },
-  qBtn: { padding: "3px 9px", background: P.s2, color: P.dim, border: `1px solid ${P.brd}`, borderRadius: 16, fontSize: 11, cursor: "pointer", whiteSpace: "nowrap", transition: "all 0.15s", fontFamily: "'Noto Sans KR'" },
-  inpWrap: { display: "flex", gap: 7, padding: "8px 10px", borderTop: `1px solid ${P.brd}`, background: P.s1, flexShrink: 0 },
-  inp: { flex: 1, padding: "8px 12px", background: P.s2, color: P.tx, border: `1px solid ${P.brd}`, borderRadius: 8, fontSize: 13, outline: "none", fontFamily: "'Noto Sans KR'" },
-  sendBtn: { width: 36, height: 36, borderRadius: 8, background: P.acc, color: P.bg, border: "none", fontSize: 16, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
-
-  /* analysis */
-  aGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, padding: 10, flexShrink: 0 },
-  aCard: { padding: "8px 10px", background: P.s2, border: `1px solid ${P.brd}`, borderRadius: 9, cursor: "pointer", textAlign: "left", transition: "all 0.15s", fontFamily: "'Noto Sans KR'", display: "flex", gap: 8, alignItems: "center" },
-  aCardAct: { borderColor: P.acc, background: P.accG },
-  aLabel: { fontSize: 12, fontWeight: 600, color: P.tx },
-  aDesc: { fontSize: 10, color: P.dim, marginTop: 1 },
-  aRes: { flex: 1, overflow: "auto", borderTop: `1px solid ${P.brd}` },
-  aResH: { padding: "8px 14px", fontSize: 13, fontWeight: 600, display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${P.brd}`, position: "sticky", top: 0, background: P.s1, zIndex: 1 },
-  aResB: { padding: 14, fontSize: 13, lineHeight: 1.8 },
-
-  /* notes */
-  nInpW: { display: "flex", gap: 7, padding: "8px 10px", borderBottom: `1px solid ${P.brd}`, flexShrink: 0 },
-  nInp: { flex: 1, padding: "7px 10px", background: P.s2, color: P.tx, border: `1px solid ${P.brd}`, borderRadius: 7, fontSize: 13, outline: "none", fontFamily: "'Noto Sans KR'" },
-  nAdd: { width: 32, height: 32, borderRadius: 7, background: P.acc, color: P.bg, border: "none", fontSize: 18, fontWeight: 700, cursor: "pointer" },
-  nList: { flex: 1, overflow: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 6 },
-  nCard: { padding: "9px 12px", background: P.s2, borderRadius: 7, animation: "fadeUp 0.2s" },
-  nMeta: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, color: P.dim, marginTop: 5 },
-  nDel: { background: "transparent", border: "none", color: P.red, fontSize: 15, cursor: "pointer" },
+  root:{fontFamily:"'Noto Sans KR',sans-serif",background:P.bg,color:P.tx,height:"100vh",display:"flex",flexDirection:"column",overflow:"hidden"},
+  hdr:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"0 16px",height:48,background:P.s1,borderBottom:`1px solid ${P.brd}`,flexShrink:0},
+  hdrL:{display:"flex",alignItems:"center",gap:12},
+  hdrR:{display:"flex",alignItems:"center",gap:8},
+  logoI:{fontSize:20,color:P.acc,fontWeight:700},
+  logoT:{fontSize:15,fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",background:`linear-gradient(135deg,${P.acc},#F0D060)`,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"},
+  fname:{fontSize:11,color:P.dim,background:P.s2,padding:"3px 10px",borderRadius:6,maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"},
+  upBtn:{padding:"5px 12px",background:P.acc,color:P.bg,border:"none",borderRadius:7,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'Noto Sans KR'"},
+  togBtn:{padding:"5px 10px",background:P.s2,color:P.tx,border:`1px solid ${P.brd}`,borderRadius:7,fontSize:14,cursor:"pointer"},
+  keyBtn:{padding:"5px 8px",background:"transparent",border:`1px solid ${P.brd}`,borderRadius:6,fontSize:14,cursor:"pointer"},
+  keyBar:{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",background:P.s2,borderBottom:`1px solid ${P.brd}`,flexShrink:0},
+  keyInput:{flex:1,padding:"5px 10px",background:P.s3,color:P.tx,border:`1px solid ${P.brd}`,borderRadius:6,fontSize:12,outline:"none",fontFamily:"monospace"},
+  keyOk:{padding:"5px 12px",background:P.acc,color:P.bg,border:"none",borderRadius:6,fontSize:12,fontWeight:600,cursor:"pointer"},
+  keyLink:{padding:"5px 10px",background:P.grn,color:P.bg,borderRadius:6,fontSize:11,fontWeight:600,textDecoration:"none",whiteSpace:"nowrap"},
+  body:{flex:1,display:"flex",overflow:"hidden"},
+  pdfPanel:{display:"flex",flexDirection:"column",transition:"flex 0.3s",borderRight:`1px solid ${P.brd}`,overflow:"hidden"},
+  pdfContainer:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"},
+  pageNav:{display:"flex",alignItems:"center",justifyContent:"center",gap:12,padding:"6px 0",background:P.s1,borderBottom:`1px solid ${P.brd}`,flexShrink:0},
+  pgBtn:{padding:"3px 10px",background:P.s2,color:P.tx,border:`1px solid ${P.brd}`,borderRadius:5,cursor:"pointer",fontSize:12},
+  pgInfo:{fontSize:12,color:P.dim,fontFamily:"'IBM Plex Mono'"},
+  pdfScroll:{flex:1,overflow:"auto",padding:12,display:"flex",flexDirection:"column",alignItems:"center",gap:8,background:"#2A2D35"},
+  pdfLoading:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:60,color:P.dim},
+  spinner:{fontSize:32,color:P.acc,animation:"spin 2s linear infinite",marginBottom:12},
+  pageWrap:{position:"relative",width:"100%",maxWidth:800},
+  pageImg:{width:"100%",borderRadius:4,boxShadow:"0 2px 12px rgba(0,0,0,0.4)"},
+  pageLabel:{position:"absolute",bottom:6,right:10,fontSize:10,color:P.dim,background:"rgba(0,0,0,0.5)",padding:"2px 8px",borderRadius:4},
+  drop:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",background:`radial-gradient(ellipse at center,${P.s2} 0%,${P.bg} 70%)`},
+  dropIn:{textAlign:"center",padding:40,maxWidth:440},
+  dropIco:{fontSize:56,color:P.acc,marginBottom:16,animation:"float 3s ease-in-out infinite",display:"block"},
+  dropH:{fontSize:20,fontWeight:700,marginBottom:6},
+  dropP:{fontSize:13,color:P.dim,marginBottom:22},
+  dropBtn:{display:"inline-block",padding:"11px 28px",background:P.acc,color:P.bg,border:"none",borderRadius:10,fontSize:14,fontWeight:600,cursor:"pointer",fontFamily:"'Noto Sans KR'",marginBottom:18},
+  tags:{display:"flex",flexWrap:"wrap",gap:6,justifyContent:"center"},
+  tag:{padding:"3px 10px",background:P.accG,color:P.acc,borderRadius:20,fontSize:11},
+  side:{flex:"0 0 380px",maxWidth:380,display:"flex",flexDirection:"column",background:P.s1,animation:"fadeUp 0.25s ease"},
+  tabBar:{display:"flex",borderBottom:`1px solid ${P.brd}`,flexShrink:0},
+  tabBtn:{flex:1,padding:"9px 0",background:"transparent",color:P.dim,border:"none",borderBottom:"2px solid transparent",fontSize:13,fontWeight:500,cursor:"pointer",fontFamily:"'Noto Sans KR'",transition:"all 0.15s"},
+  tabAct:{color:P.acc,borderBottomColor:P.acc},
+  tabC:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"},
+  chatScroll:{flex:1,overflow:"auto",padding:12,display:"flex",flexDirection:"column",gap:10},
+  uRow:{display:"flex",justifyContent:"flex-end",animation:"fadeUp 0.2s"},
+  aRow:{display:"flex",gap:7,alignItems:"flex-start",animation:"fadeUp 0.25s"},
+  avatar:{width:24,height:24,borderRadius:6,background:P.accG,color:P.acc,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:2},
+  uBub:{background:P.acc,color:P.bg,padding:"7px 12px",borderRadius:"12px 12px 3px 12px",maxWidth:"82%",fontSize:13,lineHeight:1.6,fontWeight:500},
+  aBub:{background:P.s2,color:P.tx,padding:"9px 12px",borderRadius:"3px 12px 12px 12px",maxWidth:"calc(100% - 32px)",fontSize:13,lineHeight:1.7,border:`1px solid ${P.brd}`},
+  qWrap:{padding:"5px 10px",display:"flex",flexWrap:"wrap",gap:4,borderTop:`1px solid ${P.brd}`,maxHeight:68,overflowY:"auto",flexShrink:0},
+  qBtn:{padding:"3px 9px",background:P.s2,color:P.dim,border:`1px solid ${P.brd}`,borderRadius:16,fontSize:11,cursor:"pointer",whiteSpace:"nowrap",transition:"all 0.15s",fontFamily:"'Noto Sans KR'"},
+  inpWrap:{display:"flex",gap:7,padding:"8px 10px",borderTop:`1px solid ${P.brd}`,background:P.s1,flexShrink:0},
+  inp:{flex:1,padding:"8px 12px",background:P.s2,color:P.tx,border:`1px solid ${P.brd}`,borderRadius:8,fontSize:13,outline:"none",fontFamily:"'Noto Sans KR'"},
+  sendBtn:{width:36,height:36,borderRadius:8,background:P.acc,color:P.bg,border:"none",fontSize:16,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"},
+  aGrid:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,padding:10,flexShrink:0},
+  aCard:{padding:"8px 10px",background:P.s2,border:`1px solid ${P.brd}`,borderRadius:9,cursor:"pointer",textAlign:"left",transition:"all 0.15s",fontFamily:"'Noto Sans KR'",display:"flex",gap:8,alignItems:"center"},
+  aCardAct:{borderColor:P.acc,background:P.accG},
+  aLabel:{fontSize:12,fontWeight:600,color:P.tx},
+  aDesc:{fontSize:10,color:P.dim,marginTop:1},
+  aRes:{flex:1,overflow:"auto",borderTop:`1px solid ${P.brd}`},
+  aResH:{padding:"8px 14px",fontSize:13,fontWeight:600,display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${P.brd}`,position:"sticky",top:0,background:P.s1,zIndex:1},
+  aResB:{padding:14,fontSize:13,lineHeight:1.8},
+  nInpW:{display:"flex",gap:7,padding:"8px 10px",borderBottom:`1px solid ${P.brd}`,flexShrink:0},
+  nInp:{flex:1,padding:"7px 10px",background:P.s2,color:P.tx,border:`1px solid ${P.brd}`,borderRadius:7,fontSize:13,outline:"none",fontFamily:"'Noto Sans KR'"},
+  nAdd:{width:32,height:32,borderRadius:7,background:P.acc,color:P.bg,border:"none",fontSize:18,fontWeight:700,cursor:"pointer"},
+  nList:{flex:1,overflow:"auto",padding:10,display:"flex",flexDirection:"column",gap:6},
+  nCard:{padding:"9px 12px",background:P.s2,borderRadius:7,animation:"fadeUp 0.2s"},
+  nMeta:{display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:11,color:P.dim,marginTop:5},
+  nDel:{background:"transparent",border:"none",color:P.red,fontSize:15,cursor:"pointer"},
 };

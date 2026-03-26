@@ -29,12 +29,18 @@ git push -u origin main
 1. [vercel.com](https://vercel.com) → GitHub 로그인
 2. "Import Project" → 레포 선택 → Deploy
 
-### 3. ⚠️ API Key 설정 (필수!)
+### 3. ⚠️ API Key 설정 (필수! 하지만 무료!)
 
-Vercel 대시보드에서:
-1. 프로젝트 → **Settings** → **Environment Variables**
-2. `ANTHROPIC_API_KEY` = `sk-ant-api03-...` 입력
-3. **Redeploy** 클릭
+**Gemini API Key 무료 발급:**
+1. https://aistudio.google.com/apikey 접속
+2. Google 계정 로그인
+3. "Create API Key" 클릭 → 키 복사
+
+**Vercel에 설정:**
+1. Vercel 대시보드 → 프로젝트 → **Settings** → **Environment Variables**
+2. Name: `GEMINI_API_KEY`
+3. Value: 복사한 키 붙여넣기
+4. **Save** → **Deployments** 탭에서 **Redeploy**
 
 또는 사용자가 앱 내 🔒 버튼으로 개인 API Key를 입력할 수도 있습니다.
 
@@ -42,12 +48,12 @@ Vercel 대시보드에서:
 
 ```bash
 npm install
-ANTHROPIC_API_KEY=sk-ant-... npm run dev
+GEMINI_API_KEY=AIzaSy... npm run dev
 ```
 
 ## 기술 스택
 
 - React 18 + Vite
-- Anthropic Claude API (스트리밍)
+- Google Gemini API (무료, 스트리밍)
 - Vercel Serverless Functions (API 프록시)
 - PDF.js (PDF 렌더링)
